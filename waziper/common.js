@@ -1,4 +1,4 @@
-const mysql = require('mysql');
+const mysql = require('mysql2');
 const config = require("./../config.js");
 const moment = require('moment-timezone');
 const db_connect = mysql.createPool(config.database);
@@ -145,6 +145,7 @@ const Common = {
 	},
 
 	update_status_instance: async function(instance_id, info){
+		console.log("Updating status for instance:", instance_id);
 		var res = await new Promise( async (resolve, reject)=>{
 			var data = [{
 				status: 1,
@@ -154,6 +155,11 @@ const Common = {
 			}];
 
 	        db_connect.query( "UPDATE sp_whatsapp_sessions SET ? WHERE ?", data,  (err, res)=>{
+	        	if(err) {
+	        		console.log("Database update error:", err);
+	        	} else {
+	        		console.log("Status updated successfully for instance:", instance_id);
+	        	}
 	            return resolve(res, true);
 	        });
 	    });

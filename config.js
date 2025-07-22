@@ -2,14 +2,17 @@ var config = {
 	debug: false,
 	database: {
 	    connectionLimit: 500,
-	    host: "localhost",
-	    user: "myarchery",
-	    password: "dLsN5KPGaSbFaebz",
+	    host: "127.0.0.1",
+	    user: "root",
+	    password: "",
 	    database: "blast",
 	    charset : "utf8mb4",
 	    debug: false,
 	    waitForConnections: true,
-	    multipleStatements: true
+	    multipleStatements: true,
+	    insecureAuth: true,
+	    supportBigNumbers: true,
+	    bigNumberStrings: true
 	},
 	cors: {
 		origin: '*',
