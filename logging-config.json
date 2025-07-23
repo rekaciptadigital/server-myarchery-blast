@@ -1,0 +1,17 @@
+{
+  "logging": {
+    "enabled": true,
+    "logLevel": "detailed",
+    "retentionDays": 30,
+    "maxLogFileSize": "10MB"
+  },
+  "errorHandling": {
+    "retryAttempts": 3,
+    "retryDelay": 5000,
+    "timeoutMs": 30000
+  },
+  "notifications": {
+    "alertOnFailureRate": 0.1,
+    "alertEmail": "[email]@example.com"
+  }
+}

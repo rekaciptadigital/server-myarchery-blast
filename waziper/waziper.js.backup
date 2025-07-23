@@ -18,9 +18,6 @@ const config = require("./../config.js");
 const Common = require("./common.js");
 const cron = require("node-cron");
 
-// Enhanced Message Logging
-const messageLogger = require("../simple-message-logger.js");
-
 const bulks = {};
 const chatbots = {};
 const limit_messages = {};
@@ -1404,9 +1401,6 @@ const WAZIPER = {
           sessions[instance_id]
             .sendMessage(chat_id, data)
             .then(async (message) => {
-              // Log success
-              messageLogger.logSuccess(instance_id, phone_number, post_type, message.key?.id);
-              
               callback({
                 status: 1,
                 type: type,
@@ -1417,20 +1411,11 @@ const WAZIPER = {
               WAZIPER.stats(instance_id, type, item, 1);
             })
             .catch((err) => {
-              // Log failure with detailed error info
-              messageLogger.logFailure(instance_id, phone_number, post_type, err, {
-                hasMedia: true,
-                mediaType: post_type,
-                caption: caption ? caption.substring(0, 100) : null
-              });
-              
               callback({
                 status: 0,
                 type: type,
                 phone_number: phone_number,
                 stats: true,
-                error: err.message,
-                errorType: messageLogger.parseError(err).type
               });
               WAZIPER.stats(instance_id, type, item, 0);
             });
@@ -1438,9 +1423,6 @@ const WAZIPER = {
           sessions[instance_id]
             .sendMessage(chat_id, { text: caption })
             .then((message) => {
-              // Log success
-              messageLogger.logSuccess(instance_id, phone_number, "text", message.key?.id);
-              
               callback({
                 status: 1,
                 type: type,
@@ -1451,19 +1433,11 @@ const WAZIPER = {
               WAZIPER.stats(instance_id, type, item, 1);
             })
             .catch((err) => {
-              // Log failure with detailed error info
-              messageLogger.logFailure(instance_id, phone_number, "text", err, {
-                hasMedia: false,
-                textLength: caption ? caption.length : 0
-              });
-              
               callback({
                 status: 0,
                 type: type,
                 phone_number: phone_number,
                 stats: true,
-                error: err.message,
-                errorType: messageLogger.parseError(err).type
               });
               WAZIPER.stats(instance_id, type, item, 0);
             });
