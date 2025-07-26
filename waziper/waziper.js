@@ -248,11 +248,17 @@ const WAZIPER = {
             delete bulks[instance_id];
             delete new_sessions[instance_id];
           } else if (statusCode === 440) {
-            // Handle conflict specifically - don't retry immediately
-            console.log("Conflict detected on close, not retrying immediately");
+            // Handle conflict specifically - retry after longer delay
+            console.log("Conflict detected on close, will retry after 30 seconds");
             delete sessions[instance_id];
             delete chatbots[instance_id];
             delete bulks[instance_id];
+            setTimeout(async () => {
+              if (!sessions[instance_id] && !connecting_sessions[instance_id]) {
+                console.log("Retrying connection after conflict for instance:", instance_id);
+                sessions[instance_id] = await WAZIPER.makeWASocket(instance_id);
+              }
+            }, 30000); // Wait 30 seconds
           } else {
             console.log("Connection closed, will retry with delay");
             delete sessions[instance_id];
@@ -1833,13 +1839,13 @@ const WAZIPER = {
 
   live_back: async function () {
     var account = await Common.db_query(`
-			SELECT a.changed, a.token as instance_id, a.id, b.ids as access_token 
-			FROM sp_accounts as a 
-			INNER JOIN sp_team as b ON a.team_id=b.id 
-			WHERE a.social_network = 'whatsapp' AND a.login_type = '2' AND a.status = 1 
-			ORDER BY a.changed ASC 
-			LIMIT 1
-		`);
+      SELECT a.changed, a.token as instance_id, a.id, b.ids as access_token 
+      FROM sp_accounts as a 
+      INNER JOIN sp_team as b ON a.team_id=b.id 
+      WHERE a.social_network = 'whatsapp' AND a.login_type = '2' AND a.status = 1 
+      ORDER BY a.changed ASC 
+      LIMIT 1
+    `);
 
     if (account) {
       var now = new Date().getTime() / 1000;
