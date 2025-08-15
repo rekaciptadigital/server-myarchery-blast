@@ -42,6 +42,26 @@ WAZIPER.app.post('/send_message', WAZIPER.cors, async (req, res) => {
     });
 });
 
+// PERBAIKAN: Tambahkan route untuk monitoring queue status
+WAZIPER.app.get('/queue-status/:instance_id', WAZIPER.cors, async (req, res) => {
+    var access_token = req.query.access_token;
+    var instance_id = req.params.instance_id;
+    
+    await WAZIPER.instance(access_token, instance_id, false, res, async (client) => {
+        await WAZIPER.get_queue_status(instance_id, res);
+    });
+});
+
+// Route untuk send message dengan path parameter (compatibility)
+WAZIPER.app.post('/send-message/:instance_id', WAZIPER.cors, async (req, res) => {
+    var access_token = req.query.access_token;
+    var instance_id = req.params.instance_id;
+
+    await WAZIPER.instance(access_token, instance_id, false, res, async (client) => {
+        WAZIPER.send_message(instance_id, access_token, req, res);
+    });
+});
+
 WAZIPER.app.get('/', WAZIPER.cors, async (req, res) => {
     return res.json({ status: 'success', message: "Welcome to WAZIPER" });
 });
