@@ -71,7 +71,7 @@ const {
   delay,
 } = require("@whiskeysockets/baileys");
 
-// FIX ENETUNREACH: Create custom agent that prefers IPv4
+// FIX ENETUNREACH: Create custom HTTPS agent (for media uploads)
 const customAgent = new https.Agent({
   family: 4, // Force IPv4
   keepAlive: true,
@@ -82,7 +82,31 @@ const customAgent = new https.Agent({
   scheduling: 'lifo'
 });
 
-console.log("🔧 Custom HTTPS agent created: IPv4-only (prevents IPv6 ENETUNREACH)");
+console.log("🔧 Custom HTTPS agent created: IPv4-only (for media uploads)");
+
+// CRITICAL FIX: Custom WebSocket options to force IPv4
+// This is the KEY fix for ENETUNREACH - WebSocket connections must use IPv4
+const customWebSocketOptions = {
+  agent: new https.Agent({
+    family: 4, // Force IPv4 for WebSocket connections
+    keepAlive: true,
+    timeout: 60000
+  }),
+  family: 4, // Explicitly set IPv4
+  lookup: (hostname, options, callback) => {
+    // Custom DNS lookup that returns only IPv4 addresses
+    dns.lookup(hostname, { family: 4, all: false }, (err, address, family) => {
+      if (err) {
+        console.log("❌ DNS lookup error for", hostname, ":", err.message);
+        return callback(err);
+      }
+      console.log("✅ Resolved", hostname, "to IPv4:", address);
+      callback(null, address, family);
+    });
+  }
+};
+
+console.log("🌐 Custom WebSocket options created: IPv4-only (FIXES ENETUNREACH!)");
 
 const WAZIPER = {
   io: io,
@@ -373,7 +397,8 @@ const WAZIPER = {
       defaultQueryTimeoutMs: 120000, // Increase to 120 seconds timeout
       keepAliveIntervalMs: 45000, // Increase to 45 seconds keep alive
       retryRequestDelayMs: 5000, // Add retry delay
-      fetchAgent: customAgent, // Use IPv4-only agent (fixes ENETUNREACH)
+      fetchAgent: customAgent, // Use IPv4-only agent for media uploads
+      options: customWebSocketOptions, // CRITICAL: Force IPv4 for WebSocket (fixes ENETUNREACH!)
       patchMessageBeforeSending: (message) => {
         const requiresPatch = !!(
           message.buttonsMessage ||
