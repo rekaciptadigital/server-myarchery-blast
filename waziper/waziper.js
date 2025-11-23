@@ -19,10 +19,10 @@ const Common = require("./common.js");
 const cron = require("node-cron");
 
 // Enhanced Message Logging
-const messageLogger = require("../simple-message-logger.js");
+const messageLogger = require("../src/logging/simple-message-logger.js");
 
 // Advanced Message Queue Manager
-const MessageQueueManager = require("../message-queue-manager.js");
+const MessageQueueManager = require("../src/managers/message-queue-manager.js");
 const messageQueue = new MessageQueueManager();
 
 const bulks = {};
