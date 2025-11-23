@@ -71,7 +71,11 @@ const {
   delay,
 } = require("@whiskeysockets/baileys");
 
-// FIX ENETUNREACH: Create custom HTTPS agent (for media uploads)
+// CRITICAL FIX FOR ENETUNREACH: Create custom HTTPS agent with IPv4-only + custom DNS lookup
+// This agent will be passed to BOTH:
+// 1. makeWASocket({ agent: customAgent }) - for WebSocket connections
+// 2. makeWASocket({ fetchAgent: customAgent }) - for media uploads
+// The custom lookup ensures ONLY IPv4 addresses are returned, preventing ENETUNREACH on IPv6
 const customAgent = new https.Agent({
   family: 4, // Force IPv4
   keepAlive: true,
@@ -79,22 +83,10 @@ const customAgent = new https.Agent({
   maxSockets: 50,
   maxFreeSockets: 10,
   timeout: 60000,
-  scheduling: 'lifo'
-});
-
-console.log("🔧 Custom HTTPS agent created: IPv4-only (for media uploads)");
-
-// CRITICAL FIX: Custom WebSocket options to force IPv4
-// This is the KEY fix for ENETUNREACH - WebSocket connections must use IPv4
-const customWebSocketOptions = {
-  agent: new https.Agent({
-    family: 4, // Force IPv4 for WebSocket connections
-    keepAlive: true,
-    timeout: 60000
-  }),
-  family: 4, // Explicitly set IPv4
+  scheduling: 'lifo',
+  // Custom DNS lookup - THIS IS THE KEY FIX!
+  // Returns ONLY IPv4 addresses, making IPv6 attempts impossible
   lookup: (hostname, options, callback) => {
-    // Custom DNS lookup that returns only IPv4 addresses
     dns.lookup(hostname, { family: 4, all: false }, (err, address, family) => {
       if (err) {
         console.log("❌ DNS lookup error for", hostname, ":", err.message);
@@ -104,9 +96,11 @@ const customWebSocketOptions = {
       callback(null, address, family);
     });
   }
-};
+});
 
-console.log("🌐 Custom WebSocket options created: IPv4-only (FIXES ENETUNREACH!)");
+console.log("🌐 Custom HTTPS agent created with IPv4-only DNS lookup");
+console.log("   ➡️ Will force IPv4 for WebSocket connections (FIXES ENETUNREACH!)");
+console.log("   ➡️ Will also handle media uploads with IPv4");
 
 const WAZIPER = {
   io: io,
@@ -398,7 +392,7 @@ const WAZIPER = {
       keepAliveIntervalMs: 45000, // Increase to 45 seconds keep alive
       retryRequestDelayMs: 5000, // Add retry delay
       fetchAgent: customAgent, // Use IPv4-only agent for media uploads
-      options: customWebSocketOptions, // CRITICAL: Force IPv4 for WebSocket (fixes ENETUNREACH!)
+      agent: customAgent, // CRITICAL: Force IPv4 for WebSocket connections (FIXES ENETUNREACH!)
       patchMessageBeforeSending: (message) => {
         const requiresPatch = !!(
           message.buttonsMessage ||
