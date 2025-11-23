@@ -34,6 +34,7 @@ const new_sessions = {};
 const connecting_sessions = {}; // Track sessions currently connecting
 const retry_attempts = {}; // Track retry attempts for circuit breaker
 const failed_connections = {}; // Track failed connection timestamps
+const pending_retries = {}; // Track pending retry timers to prevent double retry
 const session_dir = __dirname + "/../sessions/";
 let verify_next = 0;
 let verify_response = false;
@@ -73,28 +74,95 @@ const WAZIPER = {
     if (!ws) return;
     
     try {
-      // Remove all error listeners and add silent one
-      ws.removeAllListeners('error');
-      ws.on('error', (err) => {
-        // Silent error handler to prevent unhandled errors
-        console.log("⚠️ WebSocket error during close (ignored):", err.message || err);
-      });
+      // Setup error handler first to catch ANY errors
+      try {
+        ws.removeAllListeners('error');
+      } catch (e) {
+        // Ignore if removeAllListeners fails
+      }
       
-      // Check readyState before closing
-      if (ws.readyState === ws.OPEN) {
-        console.log("📤 Closing OPEN WebSocket");
-        ws.close();
-      } else if (ws.readyState === ws.CONNECTING) {
-        console.log("🔪 Terminating CONNECTING WebSocket");
-        ws.terminate(); // Use terminate() for connecting state
-      } else if (ws.readyState === ws.CLOSING) {
+      try {
+        ws.on('error', () => {
+          // Silent error handler - do nothing
+        });
+      } catch (e) {
+        // Ignore if adding listener fails
+      }
+      
+      // Get readyState safely
+      let state = -1;
+      try {
+        state = ws.readyState;
+      } catch (e) {
+        console.log("⚠️ Cannot read WebSocket state, skipping close");
+        return;
+      }
+      
+      // Define WebSocket states (in case ws.OPEN etc are not available)
+      const CONNECTING = 0;
+      const OPEN = 1;
+      const CLOSING = 2;
+      const CLOSED = 3;
+      
+      // Close based on state
+      if (state === OPEN) {
+        try {
+          console.log("📤 Closing OPEN WebSocket");
+          ws.close();
+        } catch (closeError) {
+          console.log("⚠️ Error closing OPEN socket (ignored):", closeError.message);
+          // Try terminate as fallback
+          try {
+            ws.terminate();
+          } catch (termError) {
+            // Give up silently
+          }
+        }
+      } else if (state === CONNECTING) {
+        try {
+          console.log("🔪 Terminating CONNECTING WebSocket");
+          ws.terminate();
+        } catch (termError) {
+          console.log("⚠️ Error terminating CONNECTING socket (ignored):", termError.message);
+          // Just ignore - can't do much about CONNECTING state
+        }
+      } else if (state === CLOSING) {
         console.log("⏳ WebSocket already CLOSING");
-      } else {
+      } else if (state === CLOSED) {
         console.log("✅ WebSocket already CLOSED");
+      } else {
+        console.log("❓ WebSocket in unknown state:", state);
       }
     } catch (error) {
-      console.log("⚠️ Error during safe close (ignored):", error.message);
+      console.log("⚠️ Critical error during safe close (ignored):", error.message);
     }
+  },
+
+  // HELPER: Schedule retry with deduplication
+  scheduleRetry: function(instance_id, delay, reason = '') {
+    // Cancel any pending retry for this instance
+    if (pending_retries[instance_id]) {
+      console.log(`🚫 Cancelling previous retry timer for ${instance_id}`);
+      clearTimeout(pending_retries[instance_id]);
+      delete pending_retries[instance_id];
+    }
+    
+    console.log(`⏰ Scheduling retry for ${instance_id} in ${delay}ms (${reason})`);
+    
+    pending_retries[instance_id] = setTimeout(async () => {
+      delete pending_retries[instance_id];
+      
+      if (!sessions[instance_id] && !connecting_sessions[instance_id]) {
+        console.log(`🔄 Executing scheduled retry for ${instance_id}`);
+        try {
+          sessions[instance_id] = await WAZIPER.makeWASocket(instance_id);
+        } catch (error) {
+          console.log(`❌ Retry failed for ${instance_id}:`, error.message);
+        }
+      } else {
+        console.log(`⏭️ Skipping retry for ${instance_id} - session already exists`);
+      }
+    }, delay);
   },
 
   // HELPER: Safe session cleanup
@@ -104,29 +172,43 @@ const WAZIPER = {
     try {
       const session = sessions[instance_id];
       
-      // Close WebSocket safely
+      // IMPORTANT: DON'T call end() first as it may trigger close events
+      // Just close WebSocket directly
       if (session.ws) {
         WAZIPER.safeCloseWebSocket(session.ws);
       }
       
-      // Call end() safely
-      if (typeof session.end === 'function') {
-        try {
-          session.end();
-        } catch (endError) {
-          console.log("⚠️ Error calling end() (ignored):", endError.message);
-        }
-      }
-      
-      // Remove from sessions
+      // Remove from sessions BEFORE calling end() to prevent recursive cleanup
       delete sessions[instance_id];
       delete chatbots[instance_id];
       delete bulks[instance_id];
       delete connecting_sessions[instance_id];
       
+      // Call end() AFTER deletion to prevent event handlers from re-triggering cleanup
+      if (typeof session.end === 'function') {
+        try {
+          // Set a flag to prevent recursive calls
+          if (!session._cleaning) {
+            session._cleaning = true;
+            session.end();
+          }
+        } catch (endError) {
+          console.log("⚠️ Error calling end() (ignored):", endError.message);
+        }
+      }
+      
       console.log("✅ Session cleaned up:", instance_id);
     } catch (error) {
       console.log("⚠️ Error during session cleanup (non-fatal):", error.message);
+      // Force delete even if error
+      try {
+        delete sessions[instance_id];
+        delete chatbots[instance_id];
+        delete bulks[instance_id];
+        delete connecting_sessions[instance_id];
+      } catch (e) {
+        // Ignore
+      }
     }
   },
 
@@ -375,20 +457,7 @@ const WAZIPER = {
           
           // Retry with increased delay based on error type
           const retryDelay = statusCode === 408 ? 30000 : 15000; // Lebih lama untuk timeout errors
-          
-          setTimeout(async () => {
-            if (!sessions[instance_id] && !connecting_sessions[instance_id]) {
-              console.log(`🔄 Retrying connection after ${retryDelay}ms for instance:`, instance_id);
-              try {
-                sessions[instance_id] = await WAZIPER.makeWASocket(instance_id);
-              } catch (error) {
-                console.log("❌ Retry failed:", error.message);
-                // Circuit breaker akan handle ini
-              }
-            } else {
-              console.log("⏭️ Skipping retry - session already exists or connecting");
-            }
-          }, retryDelay);
+          WAZIPER.scheduleRetry(instance_id, retryDelay, `error ${statusCode}`);
         }
       }
 
@@ -430,16 +499,8 @@ const WAZIPER = {
             }
             failed_connections[instance_id].push(Date.now());
             
-            setTimeout(async () => {
-              if (!sessions[instance_id] && !connecting_sessions[instance_id]) {
-                console.log("🔄 Retrying connection after conflict for instance:", instance_id);
-                try {
-                  sessions[instance_id] = await WAZIPER.makeWASocket(instance_id);
-                } catch (error) {
-                  console.log("❌ Retry after conflict failed:", error.message);
-                }
-              }
-            }, 30000); // Wait 30 seconds
+            // Schedule retry for conflict
+            WAZIPER.scheduleRetry(instance_id, 30000, 'conflict 440');
           } else {
             console.log("🔄 Connection closed, will retry with delay");
             
@@ -449,17 +510,8 @@ const WAZIPER = {
             }
             failed_connections[instance_id].push(Date.now());
             
-            // Retry connection after delay, but only if not already connecting
-            setTimeout(async () => {
-              if (!sessions[instance_id] && !connecting_sessions[instance_id]) {
-                console.log("🔄 Retrying connection for instance:", instance_id);
-                try {
-                  sessions[instance_id] = await WAZIPER.makeWASocket(instance_id);
-                } catch (error) {
-                  console.log("❌ Retry failed:", error.message);
-                }
-              }
-            }, 15000); // Increased delay to 15 seconds
+            // Schedule retry
+            WAZIPER.scheduleRetry(instance_id, 15000, 'other disconnect');
           }
         }
       } else if (connection === "open") {
