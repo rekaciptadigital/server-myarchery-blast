@@ -35,6 +35,8 @@ const connecting_sessions = {}; // Track sessions currently connecting
 const retry_attempts = {}; // Track retry attempts for circuit breaker
 const failed_connections = {}; // Track failed connection timestamps
 const pending_retries = {}; // Track pending retry timers to prevent double retry
+const network_timeout_count = {}; // Track consecutive network timeouts (ETIMEDOUT/ENETUNREACH)
+const MAX_NETWORK_TIMEOUTS = 5; // Stop retrying after 5 consecutive network timeouts
 const session_dir = __dirname + "/../sessions/";
 let verify_next = 0;
 let verify_response = false;
@@ -138,8 +140,38 @@ const WAZIPER = {
     }
   },
 
-  // HELPER: Schedule retry with deduplication
-  scheduleRetry: function(instance_id, delay, reason = '') {
+  // HELPER: Schedule retry with deduplication + network timeout circuit breaker
+  scheduleRetry: function(instance_id, delay, reason = '', is_network_timeout = false) {
+    // Check network timeout circuit breaker BEFORE scheduling
+    if (is_network_timeout) {
+      network_timeout_count[instance_id] = (network_timeout_count[instance_id] || 0) + 1;
+      
+      if (network_timeout_count[instance_id] >= MAX_NETWORK_TIMEOUTS) {
+        console.log(`🛑 🛑 🛑 NETWORK TIMEOUT CIRCUIT BREAKER ACTIVATED 🛑 🛑 🛑`);
+        console.log(`Instance: ${instance_id}`);
+        console.log(`Failed ${network_timeout_count[instance_id]} consecutive times due to ETIMEDOUT/ENETUNREACH`);
+        console.log(``);
+        console.log(`👉 AUTOMATIC RETRIES STOPPED - MANUAL INTERVENTION REQUIRED`);
+        console.log(``);
+        console.log(`Possible causes:`);
+        console.log(`  1. 🚫 Firewall blocking port 443`);
+        console.log(`  2. 🌐 No VPN/proxy configured`);
+        console.log(`  3. 🚦 ISP/datacenter blocking WhatsApp servers`);
+        console.log(`  4. 🔌 IPv6 not configured properly`);
+        console.log(``);
+        console.log(`Next steps:`);
+        console.log(`  1. Check network connectivity: ping 157.240.13.54`);
+        console.log(`  2. Test port 443: telnet 157.240.13.54 443`);
+        console.log(`  3. Configure VPN if needed`);
+        console.log(`  4. After fixing, manually restart instance via API`);
+        console.log(``);
+        
+        // Clean up and DON'T schedule retry
+        delete pending_retries[instance_id];
+        return;
+      }
+    }
+    
     // Cancel any pending retry for this instance
     if (pending_retries[instance_id]) {
       console.log(`🚫 Cancelling previous retry timer for ${instance_id}`);
@@ -148,6 +180,9 @@ const WAZIPER = {
     }
     
     console.log(`⏰ Scheduling retry for ${instance_id} in ${delay}ms (${reason})`);
+    if (is_network_timeout) {
+      console.log(`   🌐 Network timeout attempt ${network_timeout_count[instance_id]}/${MAX_NETWORK_TIMEOUTS}`);
+    }
     
     pending_retries[instance_id] = setTimeout(async () => {
       delete pending_retries[instance_id];
@@ -165,6 +200,14 @@ const WAZIPER = {
     }, delay);
   },
 
+  // HELPER: Reset network timeout counter (call when connection succeeds)
+  resetNetworkTimeoutCounter: function(instance_id) {
+    if (network_timeout_count[instance_id] && network_timeout_count[instance_id] > 0) {
+      console.log(`✅ Network timeout counter reset for ${instance_id} (was ${network_timeout_count[instance_id]})`);
+      delete network_timeout_count[instance_id];
+    }
+  },
+  
   // HELPER: Safe session cleanup
   safeCleanupSession: function(instance_id) {
     if (!sessions[instance_id]) return;
@@ -457,7 +500,8 @@ const WAZIPER = {
           
           // Retry with increased delay based on error type
           const retryDelay = statusCode === 408 ? 30000 : 15000; // Lebih lama untuk timeout errors
-          WAZIPER.scheduleRetry(instance_id, retryDelay, `error ${statusCode}`);
+          const isNetworkTimeout = statusCode === 408; // 408 = Request Timeout (ETIMEDOUT/ENETUNREACH)
+          WAZIPER.scheduleRetry(instance_id, retryDelay, `error ${statusCode}`, isNetworkTimeout);
         }
       }
 
@@ -527,6 +571,7 @@ const WAZIPER = {
         // RESET retry counters saat sukses connect
         retry_attempts[instance_id] = 0;
         failed_connections[instance_id] = [];
+        WAZIPER.resetNetworkTimeoutCounter(instance_id); // Reset network timeout counter
         console.log("🔄 Retry counters reset for:", instance_id);
         
         // Remove from connecting sessions as connection is now open
