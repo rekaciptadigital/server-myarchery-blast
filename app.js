@@ -102,23 +102,20 @@ WAZIPER.app.post('/force-retry/:instance_id', WAZIPER.cors, async (req, res) => 
     }
 });
 
-// NEW: Reset Circuit Breaker (dengan auth)
+// NEW: Reset Circuit Breaker (Public - untuk emergency recovery)
 WAZIPER.app.post('/reset-circuit-breaker/:instance_id', WAZIPER.cors, async (req, res) => {
-    const access_token = req.query.access_token;
     const instance_id = req.params.instance_id;
-    
-    if (!access_token) {
-        return res.json({
-            status: 'error',
-            message: 'Access token required'
-        });
-    }
     
     try {
         WAZIPER.resetCircuitBreaker(instance_id);
+        
+        // Also clear connecting sessions
+        delete WAZIPER.connecting_sessions?.[instance_id];
+        
         return res.json({
             status: 'success',
-            message: 'Circuit breaker reset successfully'
+            message: 'Circuit breaker reset successfully for instance: ' + instance_id,
+            instance_id: instance_id
         });
     } catch (error) {
         return res.json({

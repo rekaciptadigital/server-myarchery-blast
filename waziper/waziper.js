@@ -88,18 +88,27 @@ const WAZIPER = {
     );
 
     // Circuit breaker: Stop jika terlalu banyak failures dalam waktu singkat
-    if (failed_connections[instance_id].length >= 10) {
+    if (failed_connections[instance_id].length >= 15) {
       console.log("🔴 Circuit breaker activated for:", instance_id, "- Too many failures");
       console.log("⏸️ Waiting for manual intervention or automatic reset in 10 minutes");
       
       // Reset circuit breaker setelah 10 menit
-      setTimeout(() => {
-        console.log("🔄 Circuit breaker reset for:", instance_id);
-        failed_connections[instance_id] = [];
-        retry_attempts[instance_id] = 0;
-      }, 600000); // 10 minutes
+      if (!WAZIPER.circuit_breaker_timers) {
+        WAZIPER.circuit_breaker_timers = {};
+      }
       
-      throw new Error("Circuit breaker activated - too many failed connection attempts");
+      if (!WAZIPER.circuit_breaker_timers[instance_id]) {
+        WAZIPER.circuit_breaker_timers[instance_id] = setTimeout(() => {
+          console.log("🔄 Circuit breaker reset for:", instance_id);
+          failed_connections[instance_id] = [];
+          retry_attempts[instance_id] = 0;
+          delete WAZIPER.circuit_breaker_timers[instance_id];
+        }, 600000); // 10 minutes
+      }
+      
+      // Return null instead of throwing to prevent crash
+      console.log("⚠️ Returning null - circuit breaker active");
+      return null;
     }
 
     // Jika retry attempts terlalu banyak, tunggu lebih lama
@@ -121,13 +130,13 @@ const WAZIPER = {
           state.lastConflictTime && 
           (currentTime - state.lastConflictTime) < 120) { // 2 minutes
         console.log("🚨 Recent conflict detected, aborting connection attempt for:", instance_id);
-        throw new Error("Recent conflict detected - waiting for cooldown period");
+        return null;
       }
       
       // If too many connection attempts, slow down
       if (state.connectionAttempts > 5) {
         console.log("⚠️ Too many connection attempts for:", instance_id, "- implementing circuit breaker");
-        throw new Error("Circuit breaker activated - too many failed attempts");
+        return null;
       }
     }
 
@@ -692,7 +701,14 @@ const WAZIPER = {
     
     if (sessions[instance_id] == undefined || reset) {
       console.log("Creating new WhatsApp socket for instance:", instance_id);
-      sessions[instance_id] = await WAZIPER.makeWASocket(instance_id);
+      const newSocket = await WAZIPER.makeWASocket(instance_id);
+      
+      if (newSocket === null) {
+        console.log("⚠️ Failed to create socket - circuit breaker or conflict detected");
+        return null;
+      }
+      
+      sessions[instance_id] = newSocket;
     }
 
     return sessions[instance_id];
@@ -846,7 +862,22 @@ const WAZIPER = {
       delete bulks[instance_id];
     }
 
-    sessions[instance_id] = await WAZIPER.session(instance_id, false);
+    const sessionInstance = await WAZIPER.session(instance_id, false);
+    
+    // Handle null session (circuit breaker active)
+    if (!sessionInstance) {
+      if (res) {
+        return res.json({
+          status: "error",
+          message: "Unable to create session at this time. Please try again in a few minutes.",
+          circuit_breaker: true
+        });
+      } else {
+        return callback(null);
+      }
+    }
+    
+    sessions[instance_id] = sessionInstance;
     return callback(sessions[instance_id]);
   },
 
@@ -878,7 +909,22 @@ const WAZIPER = {
         "Client not found, creating new session for instance:",
         instance_id
       );
+      
+      // Reset circuit breaker for manual QR request
+      if (failed_connections[instance_id] && failed_connections[instance_id].length >= 15) {
+        console.log("🔄 Manual QR request - resetting circuit breaker for:", instance_id);
+        failed_connections[instance_id] = [];
+        retry_attempts[instance_id] = 0;
+      }
+      
       client = await WAZIPER.session(instance_id, true);
+      
+      if (!client) {
+        return res.json({
+          status: "error",
+          message: "Unable to create session. Circuit breaker active or too many connection attempts. Please try again in a few minutes."
+        });
+      }
     }
 
     if (client.qrcode && client.qrcode === false) {
@@ -2575,3 +2621,9 @@ cron.schedule("*/2 * * * *", function () {
 cron.schedule("*/1 * * * * *", function () {
   WAZIPER.bulk_messaging();
 });
+
+// STARTUP: Log initial status
+console.log("🚀 WAZIPER initialized");
+console.log("📊 Circuit breaker threshold: 15 failures in 5 minutes");
+console.log("⏱️ Session cleanup: Every 10 minutes");
+console.log("🔄 Live check: Every 2 minutes");

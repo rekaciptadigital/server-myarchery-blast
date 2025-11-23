@@ -1,0 +1,12 @@
+📨 Message Queue Manager initialized
+🔄 Queue processor started
+🚀 WAZIPER initialized
+📊 Circuit breaker threshold: 15 failures in 5 minutes
+⏱️ Session cleanup: Every 10 minutes
+🔄 Live check: Every 2 minutes
+WAZIPER IS LIVE
+🔄 Circuit breaker reset for: 6921B60FBF7D9
+🔄 Circuit breaker reset for: 68833D7671869
+Total sessions:  0
+Total queue sessions:  0
+Total connecting:  0
