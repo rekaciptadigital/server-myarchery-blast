@@ -1,5 +1,7 @@
 const fs = require("fs");
 const http = require("http");
+const https = require("https");
+const dns = require("dns");
 const qrimg = require("qr-image");
 const express = require("express");
 const rimraf = require("rimraf");
@@ -17,6 +19,10 @@ const { Server } = require("socket.io");
 const config = require("./../config.js");
 const Common = require("./common.js");
 const cron = require("node-cron");
+
+// FIX ENETUNREACH: Set DNS resolution order to prefer IPv4
+dns.setDefaultResultOrder('ipv4first');
+console.log("🌐 DNS resolution order set to: IPv4 first (fixes ENETUNREACH errors)");
 
 // Enhanced Message Logging
 const messageLogger = require("../src/logging/simple-message-logger.js");
@@ -64,6 +70,19 @@ const {
   Browsers,
   delay,
 } = require("@whiskeysockets/baileys");
+
+// FIX ENETUNREACH: Create custom agent that prefers IPv4
+const customAgent = new https.Agent({
+  family: 4, // Force IPv4
+  keepAlive: true,
+  keepAliveMsecs: 30000,
+  maxSockets: 50,
+  maxFreeSockets: 10,
+  timeout: 60000,
+  scheduling: 'lifo'
+});
+
+console.log("🔧 Custom HTTPS agent created: IPv4-only (prevents IPv6 ENETUNREACH)");
 
 const WAZIPER = {
   io: io,
@@ -354,6 +373,7 @@ const WAZIPER = {
       defaultQueryTimeoutMs: 120000, // Increase to 120 seconds timeout
       keepAliveIntervalMs: 45000, // Increase to 45 seconds keep alive
       retryRequestDelayMs: 5000, // Add retry delay
+      fetchAgent: customAgent, // Use IPv4-only agent (fixes ENETUNREACH)
       patchMessageBeforeSending: (message) => {
         const requiresPatch = !!(
           message.buttonsMessage ||

@@ -1,0 +1,12 @@
+🌐 DNS resolution order set to: IPv4 first (fixes ENETUNREACH errors)
+📨 Message Queue Manager initialized
+🔄 Queue processor started
+🔧 Custom HTTPS agent created: IPv4-only (prevents IPv6 ENETUNREACH)
+🚀 WAZIPER initialized
+📊 Circuit breaker threshold: 15 failures in 5 minutes
+⏱️ Session cleanup: Every 10 minutes
+🔄 Live check: Every 2 minutes
+WAZIPER IS LIVE
+Total sessions:  0
+Total queue sessions:  0
+Total connecting:  0
