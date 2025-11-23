@@ -102,6 +102,27 @@ WAZIPER.app.post('/force-retry/:instance_id', WAZIPER.cors, async (req, res) => 
     }
 });
 
+// NEW: Generate Unique Instance ID (untuk create session baru)
+WAZIPER.app.get('/generate-instance-id', WAZIPER.cors, async (req, res) => {
+    try {
+        // Generate unique instance ID menggunakan timestamp + random
+        const timestamp = Date.now().toString(36).toUpperCase();
+        const random = Math.random().toString(36).substring(2, 8).toUpperCase();
+        const instance_id = timestamp + random;
+        
+        return res.json({
+            status: 'success',
+            instance_id: instance_id,
+            message: 'Use this instance_id to create a new WhatsApp session'
+        });
+    } catch (error) {
+        return res.json({
+            status: 'error',
+            message: error.message
+        });
+    }
+});
+
 // NEW: Reset Circuit Breaker (Public - untuk emergency recovery)
 WAZIPER.app.post('/reset-circuit-breaker/:instance_id', WAZIPER.cors, async (req, res) => {
     const instance_id = req.params.instance_id;
