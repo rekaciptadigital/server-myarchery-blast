@@ -264,39 +264,16 @@ const WAZIPER = {
     });
 
     // CRITICAL FIX: Add error handler pada WebSocket directly dengan proper handling
-    // Handle error sebelum WebSocket ready
-    const setupWebSocketErrorHandler = () => {
-      if (WA.ws) {
-        // Remove existing error listeners to prevent duplicates
-        WA.ws.removeAllListeners('error');
-        
-        WA.ws.on('error', (error) => {
-          console.log("🚨 WebSocket error event caught:", error.message || error);
-          // Track failure
-          if (!failed_connections[instance_id]) {
-            failed_connections[instance_id] = [];
-          }
-          failed_connections[instance_id].push(Date.now());
-          // Prevent crash - error akan di-handle di connection.update handler
-        });
-      }
-    };
-    
-    // Setup initial error handler
-    setupWebSocketErrorHandler();
-    
-    // Re-setup error handler jika WebSocket di-recreate
-    const originalWSGetter = Object.getOwnPropertyDescriptor(WA, 'ws');
-    if (originalWSGetter) {
-      Object.defineProperty(WA, 'ws', {
-        get: function() {
-          return originalWSGetter.get.call(this);
-        },
-        set: function(value) {
-          originalWSGetter.set.call(this, value);
-          setupWebSocketErrorHandler();
-        },
-        configurable: true
+    // Simple approach - just add error handler once
+    if (WA.ws) {
+      WA.ws.on('error', (error) => {
+        console.log("🚨 WebSocket error event caught:", error.message || error);
+        // Track failure
+        if (!failed_connections[instance_id]) {
+          failed_connections[instance_id] = [];
+        }
+        failed_connections[instance_id].push(Date.now());
+        // Prevent crash - error akan di-handle di connection.update handler
       });
     }
 
@@ -1047,65 +1024,72 @@ const WAZIPER = {
     });
   },
 
-  // Clean up inactive sessions periodically - IMPROVED
+  // Clean up inactive sessions periodically - IMPROVED with safe access
   cleanupInactiveSessions: function() {
     console.log("Running enhanced session cleanup...");
     const currentTime = Date.now();
     
-    Object.keys(sessions).forEach(async (instance_id) => {
+    // Create snapshot of session keys to avoid modification during iteration
+    const sessionKeys = Object.keys(sessions);
+    
+    sessionKeys.forEach(async (instance_id) => {
+      // Re-get session to ensure it still exists
       const session = sessions[instance_id];
       
-      if (session) {
+      if (!session) return;
+      
+      try {
+        let shouldCleanup = false;
+        let hasWebSocket = false;
+        
+        // Safe check for WebSocket existence and state
         try {
-          // Check if WebSocket is still active
-          if (session.ws) {
+          hasWebSocket = session.ws && typeof session.ws === 'object';
+          
+          if (hasWebSocket) {
             const readyState = await WAZIPER.waitForOpenConnection(session.ws);
             if (readyState === 0) {
               console.log("Cleaning up inactive session:", instance_id);
-              
-              // Proper cleanup
-              try {
-                if (session.ws && session.ws.readyState === 1) {
-                  session.ws.close();
-                }
-                session.end?.();
-              } catch (error) {
-                console.log("Error during session cleanup:", error.message);
-              }
-              
-              delete sessions[instance_id];
-              delete chatbots[instance_id];
-              delete bulks[instance_id];
-              delete connecting_sessions[instance_id];
+              shouldCleanup = true;
             }
           } else {
-            // Session without WebSocket - cleanup
             console.log("Cleaning up session without WebSocket:", instance_id);
-            delete sessions[instance_id];
-            delete connecting_sessions[instance_id];
+            shouldCleanup = true;
           }
-        } catch (error) {
-          console.log("Error checking session state:", error.message);
-          delete sessions[instance_id];
-          delete connecting_sessions[instance_id];
+        } catch (wsError) {
+          console.log(`⚠️ WebSocket check error for ${instance_id}:`, wsError.message);
+          shouldCleanup = true;
+        }
+        
+        if (shouldCleanup) {
+          WAZIPER.safeCleanupSession(instance_id);
+        }
+      } catch (error) {
+        console.log(`⚠️ Error checking session state for ${instance_id}:`, error.message);
+        // Try safe cleanup anyway
+        try {
+          WAZIPER.safeCleanupSession(instance_id);
+        } catch (cleanupError) {
+          console.log(`⚠️ Cleanup also failed for ${instance_id}:`, cleanupError.message);
         }
       }
     });
     
-    // Clean up stale connecting sessions (older than 5 minutes)
-    Object.keys(connecting_sessions).forEach((instance_id) => {
+    // Clean up stale connecting sessions (older than 5 minutes) with safe access
+    const connectingKeys = Object.keys(connecting_sessions);
+    connectingKeys.forEach((instance_id) => {
       const session = connecting_sessions[instance_id];
       if (session && session.createdAt && (currentTime - session.createdAt) > 300000) {
         console.log("Cleaning up stale connecting session:", instance_id);
         
-        // Cleanup connecting session
+        // Use safe cleanup
         try {
-          if (session.ws && session.ws.readyState === 1) {
-            session.ws.close();
+          WAZIPER.safeCloseWebSocket(session.ws);
+          if (typeof session.end === 'function') {
+            session.end();
           }
-          session.end?.();
         } catch (error) {
-          console.log("Error cleaning up connecting session:", error.message);
+          console.log(`⚠️ Error cleaning up connecting session ${instance_id}:`, error.message);
         }
         
         delete connecting_sessions[instance_id];
@@ -1625,9 +1609,16 @@ const WAZIPER = {
     params,
     callback
   ) {
-    // PERBAIKAN: Cek status session sebelum mengirim
+    // PERBAIKAN: Cek status session sebelum mengirim dengan safe access
     const session = sessions[instance_id];
-    if (!session || !session.ws || session.ws.readyState !== 1) {
+    let sessionReady = false;
+    try {
+      sessionReady = session && session.ws && typeof session.ws.readyState !== 'undefined' && session.ws.readyState === 1;
+    } catch (error) {
+      console.log(`⚠️ Error checking session readiness for ${instance_id}:`, error.message);
+    }
+    
+    if (!sessionReady) {
       console.log(`⚠️ Session not ready for ${instance_id}, queueing message`);
       
       // Add to queue for later processing
@@ -2312,16 +2303,8 @@ const WAZIPER = {
         
         // Clean up old session properly before creating new one
         if (session) {
-          try {
-            if (session.ws && session.ws.readyState === 1) {
-              session.ws.close();
-            }
-            session.end?.();
-            await Common.sleep(2000); // Wait 2 seconds for cleanup
-          } catch (error) {
-            console.log(`⚠️ Error during session cleanup for ${instanceId}:`, error.message);
-          }
-          delete sessions[instanceId];
+          WAZIPER.safeCleanupSession(instanceId);
+          await Common.sleep(2000); // Wait 2 seconds for cleanup
         }
         
         await WAZIPER.instance(
@@ -2370,10 +2353,19 @@ const WAZIPER = {
     console.log("Total queue sessions: ", Object.keys(new_sessions).length);
     console.log("Total connecting: ", Object.keys(connecting_sessions).length);
     
-    // PERBAIKAN: Process message queues untuk semua active sessions
+    // PERBAIKAN: Process message queues untuk semua active sessions dengan safe access
     Object.keys(sessions).forEach(async (instanceId) => {
-      if (sessions[instanceId] && sessions[instanceId].ws && sessions[instanceId].ws.readyState === 1) {
-        await messageQueue.processInstanceQueue(instanceId, sessions, WAZIPER);
+      try {
+        const session = sessions[instanceId];
+        if (session && session.ws) {
+          const ws = session.ws;
+          // Safe access to readyState
+          if (ws && typeof ws.readyState !== 'undefined' && ws.readyState === 1) {
+            await messageQueue.processInstanceQueue(instanceId, sessions, WAZIPER);
+          }
+        }
+      } catch (error) {
+        console.log(`⚠️ Error processing queue for ${instanceId}:`, error.message);
       }
     });
     
