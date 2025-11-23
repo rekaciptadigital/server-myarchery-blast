@@ -68,6 +68,68 @@ const WAZIPER = {
   server: server,
   cors: cors(config.cors),
 
+  // HELPER: Safe WebSocket close - prevents "WebSocket was closed before connection" error
+  safeCloseWebSocket: function(ws, method = 'close') {
+    if (!ws) return;
+    
+    try {
+      // Remove all error listeners and add silent one
+      ws.removeAllListeners('error');
+      ws.on('error', (err) => {
+        // Silent error handler to prevent unhandled errors
+        console.log("⚠️ WebSocket error during close (ignored):", err.message || err);
+      });
+      
+      // Check readyState before closing
+      if (ws.readyState === ws.OPEN) {
+        console.log("📤 Closing OPEN WebSocket");
+        ws.close();
+      } else if (ws.readyState === ws.CONNECTING) {
+        console.log("🔪 Terminating CONNECTING WebSocket");
+        ws.terminate(); // Use terminate() for connecting state
+      } else if (ws.readyState === ws.CLOSING) {
+        console.log("⏳ WebSocket already CLOSING");
+      } else {
+        console.log("✅ WebSocket already CLOSED");
+      }
+    } catch (error) {
+      console.log("⚠️ Error during safe close (ignored):", error.message);
+    }
+  },
+
+  // HELPER: Safe session cleanup
+  safeCleanupSession: function(instance_id) {
+    if (!sessions[instance_id]) return;
+    
+    try {
+      const session = sessions[instance_id];
+      
+      // Close WebSocket safely
+      if (session.ws) {
+        WAZIPER.safeCloseWebSocket(session.ws);
+      }
+      
+      // Call end() safely
+      if (typeof session.end === 'function') {
+        try {
+          session.end();
+        } catch (endError) {
+          console.log("⚠️ Error calling end() (ignored):", endError.message);
+        }
+      }
+      
+      // Remove from sessions
+      delete sessions[instance_id];
+      delete chatbots[instance_id];
+      delete bulks[instance_id];
+      delete connecting_sessions[instance_id];
+      
+      console.log("✅ Session cleaned up:", instance_id);
+    } catch (error) {
+      console.log("⚠️ Error during session cleanup (non-fatal):", error.message);
+    }
+  },
+
   makeWASocket: async function (instance_id) {
     // SOLUSI ROOT CAUSE: Prevent multiple connections yang menyebabkan conflict
     if (connecting_sessions[instance_id]) {
@@ -142,18 +204,10 @@ const WAZIPER = {
 
     // Aggressive cleanup of existing session to prevent conflicts
     if (sessions[instance_id]) {
-      try {
-        console.log("🧹 Aggressive cleanup of existing session for:", instance_id);
-        if (sessions[instance_id].ws && sessions[instance_id].ws.readyState === 1) {
-          sessions[instance_id].ws.close();
-        }
-        sessions[instance_id].end?.();
-        // Critical: Wait for cleanup to complete
-        await Common.sleep(3000);
-      } catch (error) {
-        console.log("Error cleaning up existing session:", error.message);
-      }
-      delete sessions[instance_id];
+      console.log("🧹 Aggressive cleanup of existing session for:", instance_id);
+      WAZIPER.safeCleanupSession(instance_id);
+      // Critical: Wait for cleanup to complete
+      await Common.sleep(3000);
     }
 
     console.log("🔧 Creating new WhatsApp socket for instance:", instance_id);
@@ -209,11 +263,40 @@ const WAZIPER = {
       // Error akan di-handle di connection.update, jadi hanya log saja disini
     });
 
-    // CRITICAL FIX: Add error handler pada WebSocket directly
-    if (WA.ws) {
-      WA.ws.on('error', (error) => {
-        console.log("🚨 WebSocket error event caught:", error.message);
-        // Prevent crash - error akan di-handle di connection.update handler
+    // CRITICAL FIX: Add error handler pada WebSocket directly dengan proper handling
+    // Handle error sebelum WebSocket ready
+    const setupWebSocketErrorHandler = () => {
+      if (WA.ws) {
+        // Remove existing error listeners to prevent duplicates
+        WA.ws.removeAllListeners('error');
+        
+        WA.ws.on('error', (error) => {
+          console.log("🚨 WebSocket error event caught:", error.message || error);
+          // Track failure
+          if (!failed_connections[instance_id]) {
+            failed_connections[instance_id] = [];
+          }
+          failed_connections[instance_id].push(Date.now());
+          // Prevent crash - error akan di-handle di connection.update handler
+        });
+      }
+    };
+    
+    // Setup initial error handler
+    setupWebSocketErrorHandler();
+    
+    // Re-setup error handler jika WebSocket di-recreate
+    const originalWSGetter = Object.getOwnPropertyDescriptor(WA, 'ws');
+    if (originalWSGetter) {
+      Object.defineProperty(WA, 'ws', {
+        get: function() {
+          return originalWSGetter.get.call(this);
+        },
+        set: function(value) {
+          originalWSGetter.set.call(this, value);
+          setupWebSocketErrorHandler();
+        },
+        configurable: true
       });
     }
 
@@ -275,31 +358,10 @@ const WAZIPER = {
           
           // Aggressive cleanup to prevent further conflicts dengan SAFE CLOSE
           if (sessions[instance_id]) {
-            try {
-              if (sessions[instance_id].ws) {
-                const ws = sessions[instance_id].ws;
-                // SAFE CLOSE: Check state before close
-                if (ws.readyState === 0 || ws.readyState === 1) {
-                  ws.close();
-                } else {
-                  console.log("⚠️ WebSocket already closing/closed during conflict cleanup");
-                }
-              }
-              if (typeof sessions[instance_id].end === 'function') {
-                sessions[instance_id].end();
-              }
-              // Longer cleanup wait to ensure proper disconnection
-              await Common.sleep(5000);
-            } catch (error) {
-              console.log("⚠️ Error during conflict cleanup (non-fatal):", error.message);
-              // Catch to prevent crash
-            }
+            WAZIPER.safeCleanupSession(instance_id);
+            // Longer cleanup wait to ensure proper disconnection
+            await Common.sleep(5000);
           }
-          
-          delete sessions[instance_id];
-          delete chatbots[instance_id];
-          delete bulks[instance_id];
-          delete connecting_sessions[instance_id];
           
           // EXTENDED delay after conflict - let WhatsApp server cool down
           const conflictRecoveryDelay = 90000; // 1.5 minutes instead of 30 seconds
@@ -331,31 +393,8 @@ const WAZIPER = {
           
           // Clean up current session dengan SAFE CLOSE
           if (sessions[instance_id]) {
-            try {
-              // CRITICAL FIX: Safe close WebSocket - Check state sebelum close
-              if (sessions[instance_id].ws) {
-                const ws = sessions[instance_id].ws;
-                // Only close jika WebSocket masih OPEN atau CONNECTING
-                if (ws.readyState === 0 || ws.readyState === 1) {
-                  ws.close();
-                } else {
-                  console.log("WebSocket already closing/closed, skipping close()");
-                }
-              }
-              // Safe call to end function
-              if (typeof sessions[instance_id].end === 'function') {
-                sessions[instance_id].end();
-              }
-            } catch (error) {
-              console.log("⚠️ Error during cleanup (non-fatal):", error.message);
-              // Catch any errors to prevent crash
-            }
+            WAZIPER.safeCleanupSession(instance_id);
           }
-
-          delete sessions[instance_id];
-          delete chatbots[instance_id];
-          delete bulks[instance_id];
-          delete connecting_sessions[instance_id];
           
           // Retry with increased delay based on error type
           const retryDelay = statusCode === 408 ? 30000 : 15000; // Lebih lama untuk timeout errors
@@ -390,30 +429,15 @@ const WAZIPER = {
           if (statusCode === DisconnectReason.loggedOut) {
             console.log("User logged out, cleaning session");
             
-            // Safe cleanup WebSocket sebelum delete
+            // Safe cleanup WebSocket
             if (sessions[instance_id]) {
-              try {
-                if (sessions[instance_id].ws) {
-                  const ws = sessions[instance_id].ws;
-                  if (ws.readyState === 0 || ws.readyState === 1) {
-                    ws.close();
-                  }
-                }
-                if (typeof sessions[instance_id].end === 'function') {
-                  sessions[instance_id].end();
-                }
-              } catch (error) {
-                console.log("⚠️ Safe cleanup error (non-fatal):", error.message);
-              }
+              WAZIPER.safeCleanupSession(instance_id);
             }
             
             const SESSION_PATH = session_dir + instance_id;
             if (fs.existsSync(SESSION_PATH)) {
               rimraf.sync(SESSION_PATH);
             }
-            delete sessions[instance_id];
-            delete chatbots[instance_id];
-            delete bulks[instance_id];
             delete new_sessions[instance_id];
             
             // Reset retry counters
@@ -423,26 +447,10 @@ const WAZIPER = {
             // Handle conflict specifically - retry after longer delay with queue preservation
             console.log("🚨 Conflict detected on close, preserving queue and will retry after 30 seconds");
             
-            // Safe cleanup sebelum delete
+            // Safe cleanup
             if (sessions[instance_id]) {
-              try {
-                if (sessions[instance_id].ws) {
-                  const ws = sessions[instance_id].ws;
-                  if (ws.readyState === 0 || ws.readyState === 1) {
-                    ws.close();
-                  }
-                }
-                if (typeof sessions[instance_id].end === 'function') {
-                  sessions[instance_id].end();
-                }
-              } catch (error) {
-                console.log("⚠️ Safe cleanup error during conflict (non-fatal):", error.message);
-              }
+              WAZIPER.safeCleanupSession(instance_id);
             }
-            
-            delete sessions[instance_id];
-            delete chatbots[instance_id];
-            delete bulks[instance_id];
             failed_connections[instance_id].push(Date.now());
             
             setTimeout(async () => {
@@ -458,26 +466,10 @@ const WAZIPER = {
           } else {
             console.log("🔄 Connection closed, will retry with delay");
             
-            // Safe cleanup sebelum delete
+            // Safe cleanup
             if (sessions[instance_id]) {
-              try {
-                if (sessions[instance_id].ws) {
-                  const ws = sessions[instance_id].ws;
-                  if (ws.readyState === 0 || ws.readyState === 1) {
-                    ws.close();
-                  }
-                }
-                if (typeof sessions[instance_id].end === 'function') {
-                  sessions[instance_id].end();
-                }
-              } catch (error) {
-                console.log("⚠️ Safe cleanup error (non-fatal):", error.message);
-              }
+              WAZIPER.safeCleanupSession(instance_id);
             }
-            
-            delete sessions[instance_id];
-            delete chatbots[instance_id];
-            delete bulks[instance_id];
             failed_connections[instance_id].push(Date.now());
             
             // Retry connection after delay, but only if not already connecting
@@ -661,16 +653,7 @@ const WAZIPER = {
     
     // If reset is requested, clean up existing session
     if (reset && sessions[instance_id]) {
-      try {
-        if (sessions[instance_id].ws && sessions[instance_id].ws.readyState === 1) {
-          sessions[instance_id].ws.close();
-        }
-        sessions[instance_id].end?.();
-      } catch (error) {
-        console.log("Error during reset cleanup:", error.message);
-      }
-      delete sessions[instance_id];
-      delete connecting_sessions[instance_id];
+      WAZIPER.safeCleanupSession(instance_id);
     }
     
     // Check if already connecting
@@ -1007,26 +990,7 @@ const WAZIPER = {
 
   relogin: async function (instance_id, res) {
     if (sessions[instance_id]) {
-      try {
-        // SAFE CLOSE untuk relogin
-        if (sessions[instance_id].ws) {
-          const ws = sessions[instance_id].ws;
-          var readyState = await WAZIPER.waitForOpenConnection(ws);
-          if (readyState === 1 || (ws.readyState === 0 || ws.readyState === 1)) {
-            ws.close();
-          }
-        }
-        if (typeof sessions[instance_id].end === 'function') {
-          sessions[instance_id].end();
-        }
-      } catch (error) {
-        console.log("⚠️ Error during relogin cleanup (non-fatal):", error.message);
-      }
-
-      delete sessions[instance_id];
-      delete chatbots[instance_id];
-      delete bulks[instance_id];
-      delete connecting_sessions[instance_id];
+      WAZIPER.safeCleanupSession(instance_id);
       
       // Reset retry counters
       retry_attempts[instance_id] = 0;
@@ -1044,32 +1008,12 @@ const WAZIPER = {
     delete connecting_sessions[instance_id];
 
     if (sessions[instance_id]) {
-      try {
-        // SAFE CLOSE untuk logout
-        if (sessions[instance_id].ws) {
-          const ws = sessions[instance_id].ws;
-          var readyState = await WAZIPER.waitForOpenConnection(ws);
-          // Only close jika OPEN atau CONNECTING
-          if (readyState === 1 || (ws.readyState === 0 || ws.readyState === 1)) {
-            ws.close();
-          } else {
-            console.log("⚠️ WebSocket already closing/closed during logout");
-          }
-        }
-        if (typeof sessions[instance_id].end === 'function') {
-          sessions[instance_id].end();
-        }
-      } catch (error) {
-        console.log("⚠️ Error during logout cleanup (non-fatal):", error.message);
-      }
+      WAZIPER.safeCleanupSession(instance_id);
 
       var SESSION_PATH = session_dir + instance_id;
       if (fs.existsSync(SESSION_PATH)) {
         rimraf.sync(SESSION_PATH);
       }
-      delete sessions[instance_id];
-      delete chatbots[instance_id];
-      delete bulks[instance_id];
 
       if (res != undefined) {
         return res.json({ status: "success", message: "Success" });
