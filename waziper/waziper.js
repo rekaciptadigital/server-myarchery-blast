@@ -32,6 +32,8 @@ const stats_history = {};
 const sessions = {};
 const new_sessions = {};
 const connecting_sessions = {}; // Track sessions currently connecting
+const retry_attempts = {}; // Track retry attempts for circuit breaker
+const failed_connections = {}; // Track failed connection timestamps
 const session_dir = __dirname + "/../sessions/";
 let verify_next = 0;
 let verify_response = false;
@@ -72,6 +74,42 @@ const WAZIPER = {
       console.log("🛡️ Connection already in progress for instance:", instance_id);
       return connecting_sessions[instance_id];
     }
+
+    // CIRCUIT BREAKER: Check retry attempts dan failed connections
+    if (!retry_attempts[instance_id]) {
+      retry_attempts[instance_id] = 0;
+      failed_connections[instance_id] = [];
+    }
+
+    // Count recent failures (dalam 5 menit terakhir)
+    const currentTime = Date.now();
+    failed_connections[instance_id] = failed_connections[instance_id].filter(
+      timestamp => currentTime - timestamp < 300000 // 5 minutes
+    );
+
+    // Circuit breaker: Stop jika terlalu banyak failures dalam waktu singkat
+    if (failed_connections[instance_id].length >= 10) {
+      console.log("🔴 Circuit breaker activated for:", instance_id, "- Too many failures");
+      console.log("⏸️ Waiting for manual intervention or automatic reset in 10 minutes");
+      
+      // Reset circuit breaker setelah 10 menit
+      setTimeout(() => {
+        console.log("🔄 Circuit breaker reset for:", instance_id);
+        failed_connections[instance_id] = [];
+        retry_attempts[instance_id] = 0;
+      }, 600000); // 10 minutes
+      
+      throw new Error("Circuit breaker activated - too many failed connection attempts");
+    }
+
+    // Jika retry attempts terlalu banyak, tunggu lebih lama
+    if (retry_attempts[instance_id] > 5) {
+      const backoffDelay = Math.min(retry_attempts[instance_id] * 5000, 60000); // Max 60 detik
+      console.log(`⏳ Exponential backoff: Waiting ${backoffDelay}ms before retry attempt ${retry_attempts[instance_id]}`);
+      await Common.sleep(backoffDelay);
+    }
+
+    retry_attempts[instance_id]++;
 
     // CONFLICT PREVENTION: Check for recent conflict history
     if (WAZIPER.global_session_state && WAZIPER.global_session_state[instance_id]) {
@@ -155,6 +193,21 @@ const WAZIPER = {
     WA.createdAt = Date.now();
     connecting_sessions[instance_id] = WA;
 
+    // CRITICAL FIX: Add error handler untuk WebSocket errors - Mencegah crash server
+    WA.ev.on("connection.error", (error) => {
+      console.log("🚨 WebSocket connection error caught:", error.message);
+      failed_connections[instance_id].push(Date.now());
+      // Error akan di-handle di connection.update, jadi hanya log saja disini
+    });
+
+    // CRITICAL FIX: Add error handler pada WebSocket directly
+    if (WA.ws) {
+      WA.ws.on('error', (error) => {
+        console.log("🚨 WebSocket error event caught:", error.message);
+        // Prevent crash - error akan di-handle di connection.update handler
+      });
+    }
+
     WA.ev.on("connection.update", async (update) => {
       const { connection, lastDisconnect, qr, isNewLogin } = update;
       console.log(
@@ -211,17 +264,26 @@ const WAZIPER = {
           // IMPORTANT: Don't clear message queue during conflict
           // messageQueue will automatically retry when session is restored
           
-          // Aggressive cleanup to prevent further conflicts
+          // Aggressive cleanup to prevent further conflicts dengan SAFE CLOSE
           if (sessions[instance_id]) {
             try {
-              if (sessions[instance_id].ws && sessions[instance_id].ws.readyState === 1) {
-                sessions[instance_id].ws.close();
+              if (sessions[instance_id].ws) {
+                const ws = sessions[instance_id].ws;
+                // SAFE CLOSE: Check state before close
+                if (ws.readyState === 0 || ws.readyState === 1) {
+                  ws.close();
+                } else {
+                  console.log("⚠️ WebSocket already closing/closed during conflict cleanup");
+                }
               }
-              sessions[instance_id].end?.();
+              if (typeof sessions[instance_id].end === 'function') {
+                sessions[instance_id].end();
+              }
               // Longer cleanup wait to ensure proper disconnection
               await Common.sleep(5000);
             } catch (error) {
-              console.log("Error during conflict cleanup:", error.message);
+              console.log("⚠️ Error during conflict cleanup (non-fatal):", error.message);
+              // Catch to prevent crash
             }
           }
           
@@ -242,25 +304,42 @@ const WAZIPER = {
                 sessions[instance_id] = await WAZIPER.makeWASocket(instance_id);
               } catch (error) {
                 console.log("❌ Retry after conflict failed:", error.message);
+                failed_connections[instance_id].push(Date.now());
                 // Mark for even longer delay
                 if (WAZIPER.global_session_state && WAZIPER.global_session_state[instance_id]) {
                   WAZIPER.global_session_state[instance_id].connectionAttempts += 3;
                 }
               }
+            } else {
+              console.log("⏭️ Skipping conflict retry - session already exists");
             }
           }, conflictRecoveryDelay);
         } else {
           console.log("Handling other disconnect reasons, status code:", statusCode);
           
-          // Clean up current session
+          // Track failed connection
+          failed_connections[instance_id].push(Date.now());
+          
+          // Clean up current session dengan SAFE CLOSE
           if (sessions[instance_id]) {
             try {
-              if (sessions[instance_id].ws && sessions[instance_id].ws.readyState === 1) {
-                sessions[instance_id].ws.close();
+              // CRITICAL FIX: Safe close WebSocket - Check state sebelum close
+              if (sessions[instance_id].ws) {
+                const ws = sessions[instance_id].ws;
+                // Only close jika WebSocket masih OPEN atau CONNECTING
+                if (ws.readyState === 0 || ws.readyState === 1) {
+                  ws.close();
+                } else {
+                  console.log("WebSocket already closing/closed, skipping close()");
+                }
               }
-              sessions[instance_id].end?.();
+              // Safe call to end function
+              if (typeof sessions[instance_id].end === 'function') {
+                sessions[instance_id].end();
+              }
             } catch (error) {
-              console.log("Error during cleanup:", error.message);
+              console.log("⚠️ Error during cleanup (non-fatal):", error.message);
+              // Catch any errors to prevent crash
             }
           }
 
@@ -270,12 +349,19 @@ const WAZIPER = {
           delete connecting_sessions[instance_id];
           
           // Retry with increased delay based on error type
-          const retryDelay = statusCode === 408 ? 15000 : 8000; // Longer delay for timeout errors
+          const retryDelay = statusCode === 408 ? 30000 : 15000; // Lebih lama untuk timeout errors
           
           setTimeout(async () => {
             if (!sessions[instance_id] && !connecting_sessions[instance_id]) {
-              console.log(`Retrying connection after ${retryDelay}ms for instance:`, instance_id);
-              sessions[instance_id] = await WAZIPER.makeWASocket(instance_id);
+              console.log(`🔄 Retrying connection after ${retryDelay}ms for instance:`, instance_id);
+              try {
+                sessions[instance_id] = await WAZIPER.makeWASocket(instance_id);
+              } catch (error) {
+                console.log("❌ Retry failed:", error.message);
+                // Circuit breaker akan handle ini
+              }
+            } else {
+              console.log("⏭️ Skipping retry - session already exists or connecting");
             }
           }, retryDelay);
         }
@@ -294,6 +380,24 @@ const WAZIPER = {
           const statusCode = lastDisconnect.error.output?.statusCode;
           if (statusCode === DisconnectReason.loggedOut) {
             console.log("User logged out, cleaning session");
+            
+            // Safe cleanup WebSocket sebelum delete
+            if (sessions[instance_id]) {
+              try {
+                if (sessions[instance_id].ws) {
+                  const ws = sessions[instance_id].ws;
+                  if (ws.readyState === 0 || ws.readyState === 1) {
+                    ws.close();
+                  }
+                }
+                if (typeof sessions[instance_id].end === 'function') {
+                  sessions[instance_id].end();
+                }
+              } catch (error) {
+                console.log("⚠️ Safe cleanup error (non-fatal):", error.message);
+              }
+            }
+            
             const SESSION_PATH = session_dir + instance_id;
             if (fs.existsSync(SESSION_PATH)) {
               rimraf.sync(SESSION_PATH);
@@ -302,34 +406,86 @@ const WAZIPER = {
             delete chatbots[instance_id];
             delete bulks[instance_id];
             delete new_sessions[instance_id];
+            
+            // Reset retry counters
+            retry_attempts[instance_id] = 0;
+            failed_connections[instance_id] = [];
           } else if (statusCode === 440) {
             // Handle conflict specifically - retry after longer delay with queue preservation
-            console.log("Conflict detected on close, preserving queue and will retry after 30 seconds");
+            console.log("🚨 Conflict detected on close, preserving queue and will retry after 30 seconds");
+            
+            // Safe cleanup sebelum delete
+            if (sessions[instance_id]) {
+              try {
+                if (sessions[instance_id].ws) {
+                  const ws = sessions[instance_id].ws;
+                  if (ws.readyState === 0 || ws.readyState === 1) {
+                    ws.close();
+                  }
+                }
+                if (typeof sessions[instance_id].end === 'function') {
+                  sessions[instance_id].end();
+                }
+              } catch (error) {
+                console.log("⚠️ Safe cleanup error during conflict (non-fatal):", error.message);
+              }
+            }
+            
             delete sessions[instance_id];
             delete chatbots[instance_id];
             delete bulks[instance_id];
+            failed_connections[instance_id].push(Date.now());
+            
             setTimeout(async () => {
               if (!sessions[instance_id] && !connecting_sessions[instance_id]) {
-                console.log("Retrying connection after conflict for instance:", instance_id);
-                sessions[instance_id] = await WAZIPER.makeWASocket(instance_id);
+                console.log("🔄 Retrying connection after conflict for instance:", instance_id);
+                try {
+                  sessions[instance_id] = await WAZIPER.makeWASocket(instance_id);
+                } catch (error) {
+                  console.log("❌ Retry after conflict failed:", error.message);
+                }
               }
             }, 30000); // Wait 30 seconds
           } else {
-            console.log("Connection closed, will retry with delay");
+            console.log("🔄 Connection closed, will retry with delay");
+            
+            // Safe cleanup sebelum delete
+            if (sessions[instance_id]) {
+              try {
+                if (sessions[instance_id].ws) {
+                  const ws = sessions[instance_id].ws;
+                  if (ws.readyState === 0 || ws.readyState === 1) {
+                    ws.close();
+                  }
+                }
+                if (typeof sessions[instance_id].end === 'function') {
+                  sessions[instance_id].end();
+                }
+              } catch (error) {
+                console.log("⚠️ Safe cleanup error (non-fatal):", error.message);
+              }
+            }
+            
             delete sessions[instance_id];
             delete chatbots[instance_id];
             delete bulks[instance_id];
+            failed_connections[instance_id].push(Date.now());
             
             // Retry connection after delay, but only if not already connecting
             setTimeout(async () => {
               if (!sessions[instance_id] && !connecting_sessions[instance_id]) {
-                sessions[instance_id] = await WAZIPER.makeWASocket(instance_id);
+                console.log("🔄 Retrying connection for instance:", instance_id);
+                try {
+                  sessions[instance_id] = await WAZIPER.makeWASocket(instance_id);
+                } catch (error) {
+                  console.log("❌ Retry failed:", error.message);
+                }
               }
-            }, 8000); // Increased delay to 8 seconds
+            }, 15000); // Increased delay to 15 seconds
           }
         }
       } else if (connection === "open") {
-        console.log("Connection opened successfully");
+        console.log("✅ Connection opened successfully");
         console.log("User info:", WA.user);
 
         if (!WA.user?.name) {
@@ -337,6 +493,11 @@ const WAZIPER = {
         }
 
         sessions[instance_id] = WA;
+        
+        // RESET retry counters saat sukses connect
+        retry_attempts[instance_id] = 0;
+        failed_connections[instance_id] = [];
+        console.log("🔄 Retry counters reset for:", instance_id);
         
         // Remove from connecting sessions as connection is now open
         delete connecting_sessions[instance_id];
@@ -800,16 +961,30 @@ const WAZIPER = {
 
   relogin: async function (instance_id, res) {
     if (sessions[instance_id]) {
-      var readyState = await WAZIPER.waitForOpenConnection(
-        sessions[instance_id].ws
-      );
-      if (readyState === 1) {
-        sessions[instance_id].end();
+      try {
+        // SAFE CLOSE untuk relogin
+        if (sessions[instance_id].ws) {
+          const ws = sessions[instance_id].ws;
+          var readyState = await WAZIPER.waitForOpenConnection(ws);
+          if (readyState === 1 || (ws.readyState === 0 || ws.readyState === 1)) {
+            ws.close();
+          }
+        }
+        if (typeof sessions[instance_id].end === 'function') {
+          sessions[instance_id].end();
+        }
+      } catch (error) {
+        console.log("⚠️ Error during relogin cleanup (non-fatal):", error.message);
       }
 
       delete sessions[instance_id];
       delete chatbots[instance_id];
       delete bulks[instance_id];
+      delete connecting_sessions[instance_id];
+      
+      // Reset retry counters
+      retry_attempts[instance_id] = 0;
+      failed_connections[instance_id] = [];
     }
 
     await WAZIPER.session(instance_id, true);
@@ -824,15 +999,22 @@ const WAZIPER = {
 
     if (sessions[instance_id]) {
       try {
-        var readyState = await WAZIPER.waitForOpenConnection(
-          sessions[instance_id].ws
-        );
-        if (readyState === 1) {
-          sessions[instance_id].ws.close();
+        // SAFE CLOSE untuk logout
+        if (sessions[instance_id].ws) {
+          const ws = sessions[instance_id].ws;
+          var readyState = await WAZIPER.waitForOpenConnection(ws);
+          // Only close jika OPEN atau CONNECTING
+          if (readyState === 1 || (ws.readyState === 0 || ws.readyState === 1)) {
+            ws.close();
+          } else {
+            console.log("⚠️ WebSocket already closing/closed during logout");
+          }
         }
-        sessions[instance_id].end?.();
+        if (typeof sessions[instance_id].end === 'function') {
+          sessions[instance_id].end();
+        }
       } catch (error) {
-        console.log("Error during logout cleanup:", error.message);
+        console.log("⚠️ Error during logout cleanup (non-fatal):", error.message);
       }
 
       var SESSION_PATH = session_dir + instance_id;
@@ -2264,6 +2446,116 @@ const WAZIPER = {
     ]);
     if (!wa_stats) await Common.db_insert_stats(team_id);
   },
+
+  // NEW: Get circuit breaker status untuk monitoring
+  getCircuitBreakerStatus: function(instance_id) {
+    return {
+      instance_id: instance_id,
+      retry_attempts: retry_attempts[instance_id] || 0,
+      recent_failures: failed_connections[instance_id]?.length || 0,
+      circuit_breaker_active: (failed_connections[instance_id]?.length || 0) >= 10,
+      session_exists: !!sessions[instance_id],
+      connecting: !!connecting_sessions[instance_id],
+      last_failure_timestamps: failed_connections[instance_id] || []
+    };
+  },
+
+  // NEW: Force retry connection
+  forceRetry: async function(instance_id) {
+    console.log(`🔄 Force retry triggered for: ${instance_id}`);
+    
+    // Reset circuit breaker
+    retry_attempts[instance_id] = 0;
+    failed_connections[instance_id] = [];
+    
+    // Check if session already exists
+    if (sessions[instance_id]) {
+      return {
+        success: false,
+        message: 'Session already exists',
+        session_exists: true
+      };
+    }
+    
+    if (connecting_sessions[instance_id]) {
+      return {
+        success: false,
+        message: 'Connection already in progress',
+        connecting: true
+      };
+    }
+    
+    // Attempt to create new connection
+    try {
+      sessions[instance_id] = await WAZIPER.makeWASocket(instance_id);
+      return {
+        success: true,
+        message: 'Retry initiated successfully',
+        session_created: true
+      };
+    } catch (error) {
+      return {
+        success: false,
+        message: error.message,
+        error: true
+      };
+    }
+  },
+
+  // NEW: Reset circuit breaker
+  resetCircuitBreaker: function(instance_id) {
+    console.log(`🔄 Circuit breaker reset for: ${instance_id}`);
+    retry_attempts[instance_id] = 0;
+    failed_connections[instance_id] = [];
+  },
+
+  // NEW: Get overall health status
+  getHealthStatus: function() {
+    const totalInstances = Object.keys(sessions).length + Object.keys(connecting_sessions).length;
+    const activeConnections = Object.keys(sessions).length;
+    const connectingInstances = Object.keys(connecting_sessions).length;
+    
+    // Calculate circuit breaker activations
+    let circuitBreakerActive = 0;
+    let totalRetryAttempts = 0;
+    let totalFailures = 0;
+    
+    Object.keys(retry_attempts).forEach(instance_id => {
+      totalRetryAttempts += retry_attempts[instance_id] || 0;
+      const failures = failed_connections[instance_id]?.length || 0;
+      totalFailures += failures;
+      if (failures >= 10) {
+        circuitBreakerActive++;
+      }
+    });
+    
+    return {
+      server_status: 'running',
+      total_instances: totalInstances,
+      active_connections: activeConnections,
+      connecting: connectingInstances,
+      circuit_breaker_activations: circuitBreakerActive,
+      total_retry_attempts: totalRetryAttempts,
+      total_recent_failures: totalFailures,
+      health_score: this.calculateHealthScore(activeConnections, totalInstances, circuitBreakerActive)
+    };
+  },
+
+  // Calculate health score (0-100)
+  calculateHealthScore: function(active, total, cbActive) {
+    if (total === 0) return 100;
+    
+    let score = 100;
+    
+    // Penalize for inactive sessions
+    const inactiveRatio = 1 - (active / total);
+    score -= inactiveRatio * 40; // Max -40 points
+    
+    // Penalize for circuit breaker activations
+    score -= cbActive * 15; // -15 points per CB active
+    
+    return Math.max(0, Math.min(100, Math.round(score)));
+  }
 };
 
 // Run session cleanup every 10 minutes instead of 5 minutes

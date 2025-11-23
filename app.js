@@ -62,6 +62,84 @@ WAZIPER.app.post('/send-message/:instance_id', WAZIPER.cors, async (req, res) =>
     });
 });
 
+// NEW: Circuit Breaker Status Endpoint (No Auth - untuk monitoring)
+WAZIPER.app.get('/circuit-breaker-status/:instance_id', WAZIPER.cors, async (req, res) => {
+    const instance_id = req.params.instance_id;
+    
+    // Access internal state dari WAZIPER
+    const status = WAZIPER.getCircuitBreakerStatus(instance_id);
+    
+    return res.json({
+        status: 'success',
+        data: status
+    });
+});
+
+// NEW: Force Retry Endpoint (dengan auth)
+WAZIPER.app.post('/force-retry/:instance_id', WAZIPER.cors, async (req, res) => {
+    const access_token = req.query.access_token;
+    const instance_id = req.params.instance_id;
+    
+    if (!access_token) {
+        return res.json({
+            status: 'error',
+            message: 'Access token required'
+        });
+    }
+    
+    try {
+        const result = await WAZIPER.forceRetry(instance_id);
+        return res.json({
+            status: 'success',
+            message: 'Retry triggered',
+            data: result
+        });
+    } catch (error) {
+        return res.json({
+            status: 'error',
+            message: error.message
+        });
+    }
+});
+
+// NEW: Reset Circuit Breaker (dengan auth)
+WAZIPER.app.post('/reset-circuit-breaker/:instance_id', WAZIPER.cors, async (req, res) => {
+    const access_token = req.query.access_token;
+    const instance_id = req.params.instance_id;
+    
+    if (!access_token) {
+        return res.json({
+            status: 'error',
+            message: 'Access token required'
+        });
+    }
+    
+    try {
+        WAZIPER.resetCircuitBreaker(instance_id);
+        return res.json({
+            status: 'success',
+            message: 'Circuit breaker reset successfully'
+        });
+    } catch (error) {
+        return res.json({
+            status: 'error',
+            message: error.message
+        });
+    }
+});
+
+// NEW: Health Check Endpoint
+WAZIPER.app.get('/health', WAZIPER.cors, async (req, res) => {
+    const health = WAZIPER.getHealthStatus();
+    
+    return res.json({
+        status: 'success',
+        message: 'Server is running',
+        data: health,
+        timestamp: new Date().toISOString()
+    });
+});
+
 WAZIPER.app.get('/', WAZIPER.cors, async (req, res) => {
     return res.json({ status: 'success', message: "Welcome to WAZIPER" });
 });
